@@ -144,6 +144,30 @@
         gap: 10px;
       }
 
+      .controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .select {
+        appearance: none;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(255,255,255,0.10);
+        color: var(--text);
+        border-radius: 999px;
+        padding: 9px 12px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      /* Modal visibility control */
+      .modal { position: fixed; inset: 0; display: none; place-items: center; background: rgba(0,0,0,0.45); backdrop-filter: blur(2px); }
+      .modal.open { display: grid; }
+      /* Ensure hidden attribute always wins */
+      #favsModal[hidden] { display: none !important; }
+
       /* Apple-ish button feel */
       .btn {
         appearance: none;
@@ -207,7 +231,7 @@
 
   <body>
     <div class="wrap">
-      <main class="card" role="main" aria-live="polite">
+      <main id="appMain" class="card" role="main" aria-live="polite">
         <!-- Conceptual checklist:
              1) Choose a reliable quote API and define output fields (quote + author)
              2) Build a minimal, premium UI (card, typography, spacing, button)
@@ -220,31 +244,64 @@
             <h1>Funny Quote </h1>
             <p>Max effort!. Fast. Refresh for something new.</p>
           </div>
-          <button id="refreshBtn" class="btn" type="button">Refresh</button>
+          <div class="controls">
+            <label for="intervalSelect" class="sr-only" style="position:absolute;left:-9999px;">Auto-refresh interval</label>
+            <select id="intervalSelect" class="select" title="Auto-refresh interval">
+              <option value="30000">30s</option>
+              <option value="60000" selected>60s</option>
+              <option value="120000">120s</option>
+            </select>
+            <button id="autoBtn" class="btn" type="button" aria-pressed="false" title="Toggle auto-refresh">Auto: Off</button>
+            <button id="refreshBtn" class="btn" type="button">Refresh</button>
+          </div>
         </header>
 
         <section class="content">
           <div class="quote-shell" aria-label="Quote">
             <div class="shine" aria-hidden="true"></div>
 
-            <p id="quoteText" class="quote">Loading…</p>
-            <div id="quoteAuthor" class="author"></div>
+            <blockquote id="quoteText" class="quote">Loading…</blockquote>
+            <cite id="quoteAuthor" class="author"></cite>
 
             <div class="meta">
               <div class="status">
                 <span class="dot" aria-hidden="true"></span>
-                <span id="statusText">Initializing…</span>
+                <span id="statusText" aria-live="polite" aria-atomic="true">Initializing…</span>
               </div>
 
               <div class="actions">
+                <button id="favToggleBtn" class="btn" type="button" title="Save to favorites" aria-pressed="false">
+                  Save
+                </button>
                 <button id="copyBtn" class="btn" type="button" title="Copy quote">
                   Copy
+                </button>
+                <button id="openFavsBtn" class="btn" type="button" title="View favorites">
+                  Favorites
                 </button>
               </div>
             </div>
           </div>
         </section>
       </main>
+      
+      <!-- Favorites Modal -->
+      <div id="favsModal" class="modal" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="favsTitle">
+        <div class="card" style="width:min(740px, calc(100vw - 40px)); max-height: 80vh; overflow:auto;">
+          <div class="topbar" style="padding-bottom:10px;">
+            <div class="brand">
+              <h1 id="favsTitle">Favorites</h1>
+              <p>Saved quotes on this device</p>
+            </div>
+            <div class="controls">
+              <button id="closeFavsBtn" class="btn" type="button">Close</button>
+            </div>
+          </div>
+          <div class="content" id="favsList">
+            <!-- dynamically rendered -->
+          </div>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -258,9 +315,22 @@
         refreshBtn: document.getElementById("refreshBtn"),
         statusText: document.getElementById("statusText"),
         copyBtn: document.getElementById("copyBtn"),
+        main: document.getElementById("appMain"),
+        favToggleBtn: document.getElementById("favToggleBtn"),
+        openFavsBtn: document.getElementById("openFavsBtn"),
+        favsModal: document.getElementById("favsModal"),
+        closeFavsBtn: document.getElementById("closeFavsBtn"),
+        favsList: document.getElementById("favsList"),
+        autoBtn: document.getElementById("autoBtn"),
+        intervalSelect: document.getElementById("intervalSelect"),
       };
 
-      let lastRendered = { text: "", author: "" };
+      let lastRendered = { id: null, text: "", author: "" };
+      const seenQuoteKeys = new Set();
+      const LS_KEY_LAST = "rqg:lastQuote";
+      const LS_KEY_FAVS = "rqg:favorites";
+      let autoTimer = null;
+      let autoOn = false;
 
       function setStatus(msg) {
         el.statusText.textContent = msg;
@@ -269,9 +339,10 @@
       function setLoadingUI(isLoading) {
         el.refreshBtn.disabled = isLoading;
         el.copyBtn.disabled = isLoading || !lastRendered.text;
+        if (el.main) el.main.setAttribute("aria-busy", String(isLoading));
 
-        if (isLoading) {
-          // lightweight “Apple-ish” loading cue
+        if (isLoading && !lastRendered.text) {
+          // lightweight “Apple-ish” loading cue (only if we don't have cached content)
           el.quoteText.innerHTML = `<span class="skeleton" style="display:block; width: 86%;"></span>
                                    <span class="skeleton" style="display:block; width: 72%; margin-top: 10px;"></span>`;
           el.quoteAuthor.textContent = "";
@@ -290,11 +361,12 @@
         // Self-correction: allow multiple shapes
         const text = (data && (data.quote || data.content || data.text)) || "";
         const author = (data && (data.author || data.by || data.source)) || "";
-        return { text: String(text).trim(), author: String(author).trim() };
+        const id = (data && (data.id || data._id)) ?? null;
+        return { id, text: String(text).trim(), author: String(author).trim() };
       }
 
-      function renderQuote({ text, author }) {
-        lastRendered = { text, author };
+      function renderQuote({ id = null, text, author }) {
+        lastRendered = { id, text, author };
 
         el.quoteText.textContent = text;
         el.quoteAuthor.textContent = author ? `— ${author}` : "";
@@ -304,6 +376,14 @@
         el.quoteText.classList.add("fade");
 
         el.copyBtn.disabled = !text;
+
+        // Update favorite button state
+        updateFavUI();
+
+        // Persist last successful quote for quick startup
+        try {
+          localStorage.setItem(LS_KEY_LAST, JSON.stringify(lastRendered));
+        } catch {}
       }
 
       async function fetchQuoteOnce(signal) {
@@ -311,6 +391,18 @@
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         return normalizeQuotePayload(data);
+      }
+
+      function quoteKey(q) {
+        if (!q) return "";
+        // Prefer API id if present, fall back to text fingerprint
+        if (q.id != null) return `id:${q.id}`;
+        return `t:${(q.text || "").slice(0, 120)}`;
+      }
+
+      function isDuplicate(q) {
+        const key = quoteKey(q);
+        return key && seenQuoteKeys.has(key);
       }
 
       async function fetchAndRenderQuote() {
@@ -321,23 +413,29 @@
         const timeout = setTimeout(() => controller.abort(), 9000);
 
         try {
-          // ---- API Call #1 ----
-          const q1 = await fetchQuoteOnce(controller.signal);
-
-          // ---- Validation #1 ----
-          if (!isValidQuoteText(q1.text)) {
-            // Minimal self-correction: retry once
-            setStatus("Validation failed. Retrying…");
-            const q2 = await fetchQuoteOnce(controller.signal);
-
-            // ---- Validation #2 ----
-            if (!isValidQuoteText(q2.text)) {
-              throw new Error("Validation failed after retry (empty quote).");
+          // Up to 3 attempts to get a valid, non-duplicate quote
+          let picked = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            const q = await fetchQuoteOnce(controller.signal);
+            if (!isValidQuoteText(q.text)) {
+              setStatus(attempt === 1 ? "Validation failed. Retrying…" : "Still invalid. Retrying…");
+              continue;
             }
-            renderQuote(q2);
-          } else {
-            renderQuote(q1);
+            if (isDuplicate(q)) {
+              setStatus("Duplicate detected. Retrying…");
+              continue;
+            }
+            picked = q;
+            break;
           }
+
+          if (!picked) {
+            throw new Error("No valid unique quote after retries.");
+          }
+
+          // Track as seen for this session
+          seenQuoteKeys.add(quoteKey(picked));
+          renderQuote(picked);
 
           setStatus("Done.");
         } catch (err) {
@@ -349,6 +447,8 @@
         } finally {
           clearTimeout(timeout);
           setLoadingUI(false);
+          // If auto is on, schedule next tick
+          scheduleAuto();
         }
       }
 
@@ -379,7 +479,172 @@
       el.refreshBtn.addEventListener("click", fetchAndRenderQuote);
       el.copyBtn.addEventListener("click", copyToClipboard);
 
-      // Initial load
+      // ---- Favorites ----
+      function loadFavs() {
+        try {
+          const arr = JSON.parse(localStorage.getItem(LS_KEY_FAVS) || "[]");
+          return Array.isArray(arr) ? arr : [];
+        } catch { return []; }
+      }
+      function saveFavs(list) {
+        try { localStorage.setItem(LS_KEY_FAVS, JSON.stringify(list)); } catch {}
+      }
+      function isFavoritedCurrent() {
+        if (!lastRendered || !isValidQuoteText(lastRendered.text)) return false;
+        const key = quoteKey(lastRendered);
+        return loadFavs().some(q => quoteKey(q) === key);
+      }
+      function updateFavUI() {
+        const fav = isFavoritedCurrent();
+        el.favToggleBtn.setAttribute("aria-pressed", String(fav));
+        el.favToggleBtn.textContent = fav ? "Saved" : "Save";
+        el.favToggleBtn.title = fav ? "Remove from favorites" : "Save to favorites";
+        el.favToggleBtn.disabled = !lastRendered.text;
+      }
+      function toggleFavorite() {
+        if (!lastRendered || !isValidQuoteText(lastRendered.text)) return;
+        const key = quoteKey(lastRendered);
+        const favs = loadFavs();
+        const idx = favs.findIndex(q => quoteKey(q) === key);
+        if (idx >= 0) {
+          favs.splice(idx, 1);
+          setStatus("Removed from favorites.");
+        } else {
+          favs.unshift({ ...lastRendered, savedAt: Date.now() });
+          setStatus("Saved to favorites.");
+        }
+        saveFavs(favs);
+        updateFavUI();
+        // Re-render modal if open
+        if (!el.favsModal.hidden) renderFavsList();
+        setTimeout(() => setStatus("Done."), 900);
+      }
+      function renderFavsList() {
+        const favs = loadFavs();
+        if (!favs.length) {
+          el.favsList.innerHTML = '<p class="author" style="margin: 0 0 12px 0;">No favorites yet.</p>';
+          return;
+        }
+        const items = favs.map((q, i) => {
+          const text = (q.text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          const author = (q.author || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          return `
+            <div class="quote-shell" style="margin-bottom:12px;">
+              <blockquote class="quote" style="margin:0;">${text}</blockquote>
+              <cite class="author">${author ? "— " + author : ""}</cite>
+              <div class="actions" style="margin-top:12px;">
+                <button class="btn" data-act="copy" data-idx="${i}">Copy</button>
+                <button class="btn" data-act="remove" data-idx="${i}">Remove</button>
+              </div>
+            </div>`;
+        }).join("");
+        el.favsList.innerHTML = items;
+      }
+      function openFavs() {
+        renderFavsList();
+        el.favsModal.hidden = false;
+        el.favsModal.classList.add("open");
+        el.favsModal.setAttribute("aria-hidden", "false");
+        // Focus close button for accessibility
+        el.closeFavsBtn.focus();
+      }
+      function closeFavs() {
+        el.favsModal.classList.remove("open");
+        el.favsModal.hidden = true;
+        el.favsModal.setAttribute("aria-hidden", "true");
+      }
+      el.favToggleBtn.addEventListener("click", toggleFavorite);
+      el.openFavsBtn.addEventListener("click", openFavs);
+      el.closeFavsBtn.addEventListener("click", closeFavs);
+      el.favsModal.addEventListener("click", (e) => { if (e.target === el.favsModal) closeFavs(); });
+      el.favsList.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-act]");
+        if (!btn) return;
+        const idx = Number(btn.getAttribute("data-idx"));
+        const favs = loadFavs();
+        if (btn.dataset.act === "remove") {
+          favs.splice(idx, 1);
+          saveFavs(favs);
+          renderFavsList();
+          setStatus("Removed favorite.");
+        } else if (btn.dataset.act === "copy") {
+          const q = favs[idx];
+          if (q) {
+            const payload = q.text + (q.author ? ` — ${q.author}` : "");
+            navigator.clipboard.writeText(payload).then(() => {
+              setStatus("Copied to clipboard.");
+              setTimeout(() => setStatus("Done."), 900);
+            });
+          }
+        }
+      });
+
+      // ---- Auto-refresh ----
+      function clearAuto() {
+        if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+      }
+      function currentInterval() {
+        const v = Number(el.intervalSelect.value || 60000);
+        return isFinite(v) && v > 0 ? v : 60000;
+      }
+      function scheduleAuto() {
+        clearAuto();
+        if (!autoOn) return;
+        // If page hidden, wait until visible to schedule
+        if (document.hidden) return;
+        autoTimer = setTimeout(() => {
+          if (!el.refreshBtn.disabled) {
+            fetchAndRenderQuote();
+          } else {
+            scheduleAuto();
+          }
+        }, currentInterval());
+      }
+      function setAuto(on) {
+        autoOn = on;
+        el.autoBtn.setAttribute("aria-pressed", String(on));
+        el.autoBtn.textContent = on ? "Auto: On" : "Auto: Off";
+        setStatus(on ? "Auto-refresh enabled." : "Auto-refresh disabled.");
+        if (on) scheduleAuto(); else clearAuto();
+        setTimeout(() => setStatus("Done."), 900);
+      }
+      el.autoBtn.addEventListener("click", () => setAuto(!autoOn));
+      el.intervalSelect.addEventListener("change", () => {
+        if (autoOn) scheduleAuto();
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          clearAuto();
+        } else if (autoOn) {
+          scheduleAuto();
+        }
+      });
+
+      // Keyboard shortcuts: r/space to refresh, c to copy
+      document.addEventListener("keydown", (e) => {
+        const tag = (e.target && e.target.tagName) || "";
+        const isTyping = /INPUT|TEXTAREA|SELECT/.test(tag) || e.isComposing;
+        if (isTyping || e.metaKey || e.ctrlKey || e.altKey) return;
+
+        if (e.key === "c" || e.key === "C") {
+          e.preventDefault();
+          if (!el.copyBtn.disabled) copyToClipboard();
+        } else if (e.key === "r" || e.key === "R" || e.key === " ") {
+          e.preventDefault();
+          if (!el.refreshBtn.disabled) fetchAndRenderQuote();
+        }
+      });
+
+      // Initial load: render last cached (if any) for instant paint, then fetch fresh
+      try {
+        const cached = JSON.parse(localStorage.getItem(LS_KEY_LAST) || "null");
+        if (cached && isValidQuoteText(cached.text)) {
+          renderQuote(cached);
+          seenQuoteKeys.add(quoteKey(cached));
+          setStatus("Loaded last quote. Fetching fresh…");
+        }
+      } catch {}
+
       fetchAndRenderQuote();
     </script>
   </body>
